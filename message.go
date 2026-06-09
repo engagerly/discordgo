@@ -163,6 +163,19 @@ type Message struct {
 	Poll *Poll `json:"poll"`
 }
 
+// MarshalJSON ensures Components (tagged json:"-") are properly serialized.
+// Without this, cross-process relay (e.g. Gateway→Redis→Worker) loses message component data.
+func (m Message) MarshalJSON() ([]byte, error) {
+	type message Message
+	return json.Marshal(struct {
+		message
+		Components []MessageComponent `json:"components"`
+	}{
+		message:    message(m),
+		Components: m.Components,
+	})
+}
+
 // UnmarshalJSON is a helper function to unmarshal the Message.
 func (m *Message) UnmarshalJSON(data []byte) error {
 	type message Message

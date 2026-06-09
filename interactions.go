@@ -434,6 +434,19 @@ func (d *ModalSubmitInteractionData) UnmarshalJSON(data []byte) error {
 	return err
 }
 
+// MarshalJSON ensures Components (tagged json:"-") are properly serialized.
+// Without this, cross-process relay (e.g. Gateway→Redis→Worker) loses modal form data.
+func (d ModalSubmitInteractionData) MarshalJSON() ([]byte, error) {
+	type modalSubmitInteractionData ModalSubmitInteractionData
+	return json.Marshal(struct {
+		modalSubmitInteractionData
+		Components []MessageComponent `json:"components"`
+	}{
+		modalSubmitInteractionData: modalSubmitInteractionData(d),
+		Components:                 d.Components,
+	})
+}
+
 // ApplicationCommandInteractionDataOption represents an option of a slash command.
 type ApplicationCommandInteractionDataOption struct {
 	Name string                       `json:"name"`
