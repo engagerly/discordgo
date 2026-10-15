@@ -36,6 +36,15 @@ var ErrWSNotFound = errors.New("no websocket connection exists")
 // more than the total shard count
 var ErrWSShardBounds = errors.New("ShardID must be less than ShardCount")
 
+// ErrInvalidSession is returned by Open when Discord answers the Identify or
+// Resume packet with an Op 9 (Invalid Session) instead of READY/RESUMED.
+// Typical causes: identify rate limit (max_concurrency), a resume Discord no
+// longer accepts, or a bad token. Open closes the websocket before returning
+// and does NOT reconnect by itself; when Discord flagged the session as not
+// resumable the stored session_id/sequence are discarded so that the next
+// Open sends a fresh Identify. Callers should back off and call Open again.
+var ErrInvalidSession = errors.New("gateway rejected identify/resume with Op 9 (invalid session)")
+
 type resumePacket struct {
 	Op   int `json:"op"`
 	Data struct {
@@ -181,8 +190,27 @@ func (s *Session) Open() error {
 	if err != nil {
 		return err
 	}
-	e, err = s.onEvent(mt, m)
+	e, err = s.decodeEvent(mt, m)
 	if err != nil {
+		return err
+	}
+	// Op 9 (Invalid Session) and Op 7 (Reconnect) at this point must not go
+	// through onEvent: it would call CloseWithCode() -> s.Lock() on the very
+	// goroutine that already holds the lock (deadlock, Open never returns)
+	// and then reconnect() from inside Open. Handle them here while still
+	// holding the lock: close the socket, keep or discard the session info,
+	// and hand the decision to retry back to the caller.
+	switch e.Operation {
+	case 9:
+		err = s.invalidSessionDuringOpen(e)
+		return err
+	case 7:
+		s.log(LogWarning, "Op 7 Reconnect received before READY/RESUMED, closing websocket")
+		s.sendCloseFrame(websocket.CloseServiceRestart)
+		err = fmt.Errorf("gateway requested reconnect (Op 7) before READY/RESUMED")
+		return err
+	}
+	if err = s.dispatchEvent(e); err != nil {
 		return err
 	}
 	if e.Type != `READY` && e.Type != `RESUMED` {
@@ -564,6 +592,16 @@ func (s *Session) requestGuildMembers(data requestGuildMembersData) (err error) 
 // If you use the AddHandler() function to register a handler for the
 // "OnEvent" event then all events will be passed to that handler.
 func (s *Session) onEvent(messageType int, message []byte) (*Event, error) {
+	e, err := s.decodeEvent(messageType, message)
+	if err != nil {
+		return e, err
+	}
+	return e, s.dispatchEvent(e)
+}
+
+// decodeEvent uncompresses (if needed) and decodes a raw gateway message into
+// an Event without acting on it.
+func (s *Session) decodeEvent(messageType int, message []byte) (*Event, error) {
 
 	var err error
 	var reader io.Reader
@@ -597,6 +635,15 @@ func (s *Session) onEvent(messageType int, message []byte) (*Event, error) {
 	}
 
 	s.log(LogDebug, "Op: %d, Seq: %d, Type: %s, Data: %s\n\n", e.Operation, e.Sequence, e.Type, string(e.RawData))
+	return e, nil
+}
+
+// dispatchEvent acts on a decoded gateway event: answers heartbeat requests,
+// handles Op 7/9 by closing and reconnecting (must NOT be called while
+// holding s.Lock, see Open), and passes dispatch events to the handlers.
+func (s *Session) dispatchEvent(e *Event) error {
+
+	var err error
 
 	// Ping request.
 	// Must respond with a heartbeat packet within 5 seconds
@@ -607,10 +654,10 @@ func (s *Session) onEvent(messageType int, message []byte) (*Event, error) {
 		s.wsMutex.Unlock()
 		if err != nil {
 			s.log(LogError, "error sending heartbeat in response to Op1")
-			return e, err
+			return err
 		}
 
-		return e, nil
+		return nil
 	}
 
 	// Reconnect
@@ -619,7 +666,7 @@ func (s *Session) onEvent(messageType int, message []byte) (*Event, error) {
 		s.log(LogInformational, "Closing and reconnecting in response to Op7")
 		s.CloseWithCode(websocket.CloseServiceRestart)
 		s.reconnect()
-		return e, nil
+		return nil
 	}
 
 	// Invalid Session
@@ -631,7 +678,7 @@ func (s *Session) onEvent(messageType int, message []byte) (*Event, error) {
 		var resumable bool
 		if err := json.Unmarshal(e.RawData, &resumable); err != nil {
 			s.log(LogError, "error unmarshalling invalid session event, %s", err)
-			return e, err
+			return err
 		}
 
 		if !resumable {
@@ -642,12 +689,12 @@ func (s *Session) onEvent(messageType int, message []byte) (*Event, error) {
 		}
 
 		s.reconnect()
-		return e, nil
+		return nil
 	}
 
 	if e.Operation == 10 {
 		// Op10 is handled by Open()
-		return e, nil
+		return nil
 	}
 
 	if e.Operation == 11 {
@@ -655,15 +702,15 @@ func (s *Session) onEvent(messageType int, message []byte) (*Event, error) {
 		s.LastHeartbeatAck = time.Now().UTC()
 		s.Unlock()
 		s.log(LogDebug, "got heartbeat ACK")
-		return e, nil
+		return nil
 	}
 
 	// Do not try to Dispatch a non-Dispatch Message
 	if e.Operation != 0 {
 		// But we probably should be doing something with them.
 		// TEMP
-		s.log(LogWarning, "unknown Op: %d, Seq: %d, Type: %s, Data: %s, message: %s", e.Operation, e.Sequence, e.Type, string(e.RawData), string(message))
-		return e, nil
+		s.log(LogWarning, "unknown Op: %d, Seq: %d, Type: %s, Data: %s", e.Operation, e.Sequence, e.Type, string(e.RawData))
+		return nil
 	}
 
 	// Store the message sequence
@@ -693,7 +740,7 @@ func (s *Session) onEvent(messageType int, message []byte) (*Event, error) {
 	// For legacy reasons, we send the raw event also, this could be useful for handling unknown events.
 	s.handleEvent(eventEventType, e)
 
-	return e, nil
+	return nil
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -890,6 +937,42 @@ func (s *Session) identify() error {
 	s.wsMutex.Unlock()
 
 	return err
+}
+
+// invalidSessionDuringOpen handles an Op 9 that arrives as the answer to our
+// Identify/Resume while Open still holds s.Lock. It only sends a close frame
+// and updates the session bookkeeping; Open's deferred cleanup closes the
+// socket because a non-nil error is returned.
+func (s *Session) invalidSessionDuringOpen(e *Event) error {
+	var resumable bool
+	if err := json.Unmarshal(e.RawData, &resumable); err != nil {
+		s.log(LogError, "error unmarshalling invalid session event, %s", err)
+	}
+	s.log(LogWarning, "Op 9 Invalid Session received during Open (resumable=%t), closing websocket without reconnect", resumable)
+
+	if !resumable {
+		s.log(LogInformational, "Gateway session is not resumable, discarding its information")
+		s.resumeGatewayURL = ""
+		s.sessionID = ""
+		atomic.StoreInt64(s.sequence, 0)
+	}
+
+	s.sendCloseFrame(websocket.CloseServiceRestart)
+	return ErrInvalidSession
+}
+
+// sendCloseFrame writes a close frame on the gateway websocket, best effort.
+// Caller must hold s.Lock (or otherwise own s.wsConn).
+func (s *Session) sendCloseFrame(closeCode int) {
+	if s.wsConn == nil {
+		return
+	}
+	s.wsMutex.Lock()
+	err := s.wsConn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(closeCode, ""))
+	s.wsMutex.Unlock()
+	if err != nil {
+		s.log(LogInformational, "error sending close frame, %s", err)
+	}
 }
 
 func (s *Session) reconnect() {
