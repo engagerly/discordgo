@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"sync/atomic"
 	"time"
@@ -44,6 +45,22 @@ var ErrWSShardBounds = errors.New("ShardID must be less than ShardCount")
 // resumable the stored session_id/sequence are discarded so that the next
 // Open sends a fresh Identify. Callers should back off and call Open again.
 var ErrInvalidSession = errors.New("gateway rejected identify/resume with Op 9 (invalid session)")
+
+// ErrOpenTimeout is returned by Open when Discord does not send the Hello
+// packet, or the READY/RESUMED answer to our Identify/Resume, within
+// OpenReadTimeout. Open closes the websocket before returning and does NOT
+// reconnect by itself. Without this bound a half-dead connection (proxy, TUN,
+// silently dropped peer) kept Open blocked forever while holding the session
+// lock, and every later Close()/field read on the Session blocked with it.
+var ErrOpenTimeout = errors.New("gateway did not answer within OpenReadTimeout during Open")
+
+// OpenReadTimeout bounds each of the two reads Open performs before the
+// session is established: waiting for Hello (Op 10) and waiting for
+// READY/RESUMED. Hello normally arrives within milliseconds and READY within
+// a few seconds even for large bots. The deadline is cleared before the
+// listen goroutine takes over the connection. The dial itself is bounded by
+// Dialer.HandshakeTimeout.
+var OpenReadTimeout = 30 * time.Second
 
 type resumePacket struct {
 	Op   int `json:"op"`
@@ -120,8 +137,14 @@ func (s *Session) Open() error {
 
 	// The first response from Discord should be an Op 10 (Hello) Packet.
 	// When processed by onEvent the heartbeat goroutine will be started.
+	// Both reads below are bounded by OpenReadTimeout: Open holds s.Lock, so an
+	// unbounded read here would wedge the whole Session (see ErrOpenTimeout).
+	if err = s.wsConn.SetReadDeadline(time.Now().Add(OpenReadTimeout)); err != nil {
+		return err
+	}
 	mt, m, err := s.wsConn.ReadMessage()
 	if err != nil {
+		err = wrapOpenReadErr(err, "hello")
 		return err
 	}
 	e, err := s.onEvent(mt, m)
@@ -186,8 +209,12 @@ func (s *Session) Open() error {
 	}
 
 	// Now Discord should send us a READY or RESUMED packet.
+	if err = s.wsConn.SetReadDeadline(time.Now().Add(OpenReadTimeout)); err != nil {
+		return err
+	}
 	mt, m, err = s.wsConn.ReadMessage()
 	if err != nil {
+		err = wrapOpenReadErr(err, "ready")
 		return err
 	}
 	e, err = s.decodeEvent(mt, m)
@@ -227,6 +254,13 @@ func (s *Session) Open() error {
 	if s.VoiceConnections == nil {
 		s.log(LogInformational, "creating new VoiceConnections map")
 		s.VoiceConnections = make(map[string]*VoiceConnection)
+	}
+
+	// The connection now belongs to listen(), which must block indefinitely:
+	// clear the Open read deadline or the next quiet stretch longer than
+	// OpenReadTimeout would be reported as a read error and trigger a reconnect.
+	if err = s.wsConn.SetReadDeadline(time.Time{}); err != nil {
+		return err
 	}
 
 	// Create listening chan outside of listen, as it needs to happen inside the
@@ -959,6 +993,17 @@ func (s *Session) invalidSessionDuringOpen(e *Event) error {
 
 	s.sendCloseFrame(websocket.CloseServiceRestart)
 	return ErrInvalidSession
+}
+
+// wrapOpenReadErr maps a read-deadline expiry during Open to ErrOpenTimeout
+// (wrapped, so errors.Is works and the stage stays visible); other errors pass
+// through unchanged.
+func wrapOpenReadErr(err error, stage string) error {
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return fmt.Errorf("%w: no %s packet after %s", ErrOpenTimeout, stage, OpenReadTimeout)
+	}
+	return err
 }
 
 // sendCloseFrame writes a close frame on the gateway websocket, best effort.
