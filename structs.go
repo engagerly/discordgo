@@ -100,6 +100,15 @@ type Session struct {
 	// The dialer used for WebSocket connection
 	Dialer *websocket.Dialer
 
+	// OpenReadTimeout bounds each of the two reads Open performs before the
+	// session is established: waiting for Hello (Op 10) and waiting for
+	// READY/RESUMED. Hello normally arrives within milliseconds and READY
+	// within a few seconds even for large bots. The deadline is cleared before
+	// the listen goroutine takes over the connection. Zero means
+	// DefaultOpenReadTimeout. The dial itself is bounded by
+	// Dialer.HandshakeTimeout.
+	OpenReadTimeout time.Duration
+
 	// The user agent used for REST APIs
 	UserAgent string
 

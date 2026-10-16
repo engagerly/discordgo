@@ -51,11 +51,11 @@ func newSilentGateway(t *testing.T, sendHello bool) *silentGateway {
 func (sg *silentGateway) url() string { return "ws" + sg.srv.URL[len("http"):] }
 func (sg *silentGateway) close()      { sg.srv.Close() }
 
-// withOpenReadTimeout shrinks OpenReadTimeout for the test and restores it.
-func withOpenReadTimeout(t *testing.T, d time.Duration) {
-	old := OpenReadTimeout
-	OpenReadTimeout = d
-	t.Cleanup(func() { OpenReadTimeout = old })
+// newTimeoutTestSession is newTestSession with a short OpenReadTimeout.
+func newTimeoutTestSession(t *testing.T, gateway string, d time.Duration) *Session {
+	s := newTestSession(t, gateway)
+	s.OpenReadTimeout = d
+	return s
 }
 
 // assertSessionUsable checks the lock was released by a failed Open: Close()
@@ -72,11 +72,10 @@ func assertSessionUsable(t *testing.T, s *Session) {
 }
 
 func TestOpenTimesOutWaitingForHello(t *testing.T) {
-	withOpenReadTimeout(t, 200*time.Millisecond)
-	sg := newSilentGateway(t, false)
+		sg := newSilentGateway(t, false)
 	defer sg.close()
 
-	s := newTestSession(t, sg.url())
+	s := newTimeoutTestSession(t, sg.url(), 200*time.Millisecond)
 	start := time.Now()
 	err := openWithTimeout(t, s)
 	if !errors.Is(err, ErrOpenTimeout) {
@@ -92,11 +91,10 @@ func TestOpenTimesOutWaitingForHello(t *testing.T) {
 }
 
 func TestOpenTimesOutWaitingForReady(t *testing.T) {
-	withOpenReadTimeout(t, 200*time.Millisecond)
-	sg := newSilentGateway(t, true)
+		sg := newSilentGateway(t, true)
 	defer sg.close()
 
-	s := newTestSession(t, sg.url())
+	s := newTimeoutTestSession(t, sg.url(), 200*time.Millisecond)
 	var disconnects int32
 	s.AddHandler(func(*Session, *Disconnect) { atomic.AddInt32(&disconnects, 1) })
 
@@ -136,8 +134,7 @@ func TestOpenTimesOutWaitingForReady(t *testing.T) {
 // Once READY arrived the connection belongs to listen(), which must be able to
 // sit idle far longer than OpenReadTimeout: the deadline must have been cleared.
 func TestOpenClearsReadDeadlineForListen(t *testing.T) {
-	withOpenReadTimeout(t, 100*time.Millisecond)
-	fg := newFakeGateway(t, func(map[string]interface{}) interface{} {
+		fg := newFakeGateway(t, func(map[string]interface{}) interface{} {
 		return map[string]interface{}{"op": 0, "s": 1, "t": "READY", "d": map[string]interface{}{
 			"v": 10, "session_id": "idle-sess", "resume_gateway_url": "wss://resume.example",
 			"user":   map[string]interface{}{"id": "1", "username": "bot"},
@@ -146,7 +143,7 @@ func TestOpenClearsReadDeadlineForListen(t *testing.T) {
 	})
 	defer fg.close()
 
-	s := newTestSession(t, fg.url())
+	s := newTimeoutTestSession(t, fg.url(), 100*time.Millisecond)
 	var disconnects int32
 	s.AddHandler(func(*Session, *Disconnect) { atomic.AddInt32(&disconnects, 1) })
 	if err := openWithTimeout(t, s); err != nil {

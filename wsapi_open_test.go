@@ -183,13 +183,88 @@ func TestOpenReadySucceeds(t *testing.T) {
 	}
 }
 
-// Op 9 after READY (i.e. in the listen goroutine) must still take the regular
-// onEvent path: decode + dispatch must be equivalent to the old onEvent.
-func TestOnEventDecodesDispatchPayload(t *testing.T) {
+func TestOpenReconnectRequestedKeepsSession(t *testing.T) {
+	fg := newFakeGateway(t, func(identify map[string]interface{}) interface{} {
+		if op, _ := identify["op"].(float64); op != 6 {
+			t.Errorf("expected Resume (op 6), got %v", identify["op"])
+		}
+		return map[string]interface{}{"op": 7}
+	})
+	defer fg.close()
+
+	s := newTestSession(t, fg.url())
+	s.sessionID = "sess"
+	s.resumeGatewayURL = fg.url()
+	atomic.StoreInt64(s.sequence, 42)
+
+	if err := openWithTimeout(t, s); !errors.Is(err, ErrReconnectRequested) {
+		t.Fatalf("expected ErrReconnectRequested, got %v", err)
+	}
+	if s.wsConn != nil {
+		t.Fatal("wsConn must be nil after a failed Open")
+	}
+	if s.sessionID != "sess" || atomic.LoadInt64(s.sequence) != 42 {
+		t.Fatalf("Op 7 must keep session info for the next Resume, got id=%q seq=%d", s.sessionID, atomic.LoadInt64(s.sequence))
+	}
+	assertSessionUsable(t, s)
+	if n := atomic.LoadInt32(&fg.identifys); n != 1 {
+		t.Fatalf("expected exactly 1 resume attempt (no internal reconnect loop), got %d", n)
+	}
+}
+
+// A heartbeat ACK in place of READY is not a protocol error for Open: it must
+// be recorded without touching s.Lock (which Open holds) and Open continues.
+func TestOpenHeartbeatAckBeforeReadyDoesNotDeadlock(t *testing.T) {
+	fg := newFakeGateway(t, func(map[string]interface{}) interface{} {
+		return map[string]interface{}{"op": 11}
+	})
+	defer fg.close()
+
+	s := newTestSession(t, fg.url())
+	before := s.LastHeartbeatAck
+	time.Sleep(time.Millisecond)
+	if err := openWithTimeout(t, s); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if !s.LastHeartbeatAck.After(before) {
+		t.Fatal("Op 11 before READY must update LastHeartbeatAck")
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Op 9 after READY arrives through listen() -> onEvent, where no lock is held.
+// That path must keep the pre-split behaviour: close, discard a non-resumable
+// session, emit Disconnect, and defer to reconnect() (a no-op here because
+// ShouldReconnectOnError is false).
+func TestOnEventInvalidSessionOutsideOpen(t *testing.T) {
 	s := newTestSession(t, "ws://unused")
-	raw, _ := json.Marshal(map[string]interface{}{"op": 11})
-	e, err := s.onEvent(websocket.TextMessage, raw)
-	if err != nil || e.Operation != 11 {
-		t.Fatalf("onEvent op 11: e=%+v err=%v", e, err)
+	s.sessionID = "sess"
+	s.resumeGatewayURL = "ws://resume"
+	atomic.StoreInt64(s.sequence, 42)
+	var disconnects int32
+	s.AddHandler(func(*Session, *Disconnect) { atomic.AddInt32(&disconnects, 1) })
+
+	raw, _ := json.Marshal(map[string]interface{}{"op": 9, "d": false})
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.onEvent(websocket.TextMessage, raw)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("onEvent op 9: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("onEvent(Op 9) did not return within 5s")
+	}
+	if s.sessionID != "" || s.resumeGatewayURL != "" || atomic.LoadInt64(s.sequence) != 0 {
+		t.Fatalf("non-resumable Op 9 must discard session info, got id=%q url=%q seq=%d",
+			s.sessionID, s.resumeGatewayURL, atomic.LoadInt64(s.sequence))
+	}
+	if atomic.LoadInt32(&disconnects) != 1 {
+		t.Fatalf("Disconnect fired %d times, want 1", disconnects)
 	}
 }

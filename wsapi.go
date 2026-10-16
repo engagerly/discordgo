@@ -48,19 +48,22 @@ var ErrInvalidSession = errors.New("gateway rejected identify/resume with Op 9 (
 
 // ErrOpenTimeout is returned by Open when Discord does not send the Hello
 // packet, or the READY/RESUMED answer to our Identify/Resume, within
-// OpenReadTimeout. Open closes the websocket before returning and does NOT
-// reconnect by itself. Without this bound a half-dead connection (proxy, TUN,
-// silently dropped peer) kept Open blocked forever while holding the session
-// lock, and every later Close()/field read on the Session blocked with it.
+// Session.OpenReadTimeout. Open closes the websocket before returning and does
+// NOT reconnect by itself. Without this bound a half-dead connection (proxy,
+// TUN, silently dropped peer) kept Open blocked forever while holding the
+// session lock, and every later Close()/field read on the Session blocked
+// with it.
 var ErrOpenTimeout = errors.New("gateway did not answer within OpenReadTimeout during Open")
 
-// OpenReadTimeout bounds each of the two reads Open performs before the
-// session is established: waiting for Hello (Op 10) and waiting for
-// READY/RESUMED. Hello normally arrives within milliseconds and READY within
-// a few seconds even for large bots. The deadline is cleared before the
-// listen goroutine takes over the connection. The dial itself is bounded by
-// Dialer.HandshakeTimeout.
-var OpenReadTimeout = 30 * time.Second
+// ErrReconnectRequested is returned by Open when Discord answers the Identify
+// or Resume packet with an Op 7 (Reconnect) instead of READY/RESUMED. Open
+// closes the websocket before returning and does NOT reconnect by itself; the
+// stored session_id/sequence are kept so that the next Open sends a Resume.
+var ErrReconnectRequested = errors.New("gateway requested reconnect (Op 7) before READY/RESUMED")
+
+// DefaultOpenReadTimeout is the value New() assigns to Session.OpenReadTimeout
+// and the value Open falls back to when the field is zero.
+const DefaultOpenReadTimeout = 30 * time.Second
 
 type resumePacket struct {
 	Op   int `json:"op"`
@@ -135,19 +138,25 @@ func (s *Session) Open() error {
 		}
 	}()
 
-	// The first response from Discord should be an Op 10 (Hello) Packet.
-	// When processed by onEvent the heartbeat goroutine will be started.
-	// Both reads below are bounded by OpenReadTimeout: Open holds s.Lock, so an
-	// unbounded read here would wedge the whole Session (see ErrOpenTimeout).
-	if err = s.wsConn.SetReadDeadline(time.Now().Add(OpenReadTimeout)); err != nil {
+	// The first response from Discord should be an Op 10 (Hello) Packet. Its
+	// heartbeat_interval is used to start the heartbeat goroutine at the end
+	// of Open. Both reads below are bounded by OpenReadTimeout: Open holds
+	// s.Lock, so an unbounded read here would wedge the whole Session (see
+	// ErrOpenTimeout). They also only decode, never dispatch: dispatchEvent
+	// takes s.Lock for Op 7/9/11 and would deadlock on this goroutine.
+	openReadTimeout := s.OpenReadTimeout
+	if openReadTimeout <= 0 {
+		openReadTimeout = DefaultOpenReadTimeout
+	}
+	if err = s.wsConn.SetReadDeadline(time.Now().Add(openReadTimeout)); err != nil {
 		return err
 	}
 	mt, m, err := s.wsConn.ReadMessage()
 	if err != nil {
-		err = wrapOpenReadErr(err, "hello")
+		err = wrapOpenReadErr(err, "hello", openReadTimeout)
 		return err
 	}
-	e, err := s.onEvent(mt, m)
+	e, err := s.decodeEvent(mt, m)
 	if err != nil {
 		return err
 	}
@@ -209,12 +218,12 @@ func (s *Session) Open() error {
 	}
 
 	// Now Discord should send us a READY or RESUMED packet.
-	if err = s.wsConn.SetReadDeadline(time.Now().Add(OpenReadTimeout)); err != nil {
+	if err = s.wsConn.SetReadDeadline(time.Now().Add(openReadTimeout)); err != nil {
 		return err
 	}
 	mt, m, err = s.wsConn.ReadMessage()
 	if err != nil {
-		err = wrapOpenReadErr(err, "ready")
+		err = wrapOpenReadErr(err, "ready", openReadTimeout)
 		return err
 	}
 	e, err = s.decodeEvent(mt, m)
@@ -222,23 +231,28 @@ func (s *Session) Open() error {
 		return err
 	}
 	// Op 9 (Invalid Session) and Op 7 (Reconnect) at this point must not go
-	// through onEvent: it would call CloseWithCode() -> s.Lock() on the very
-	// goroutine that already holds the lock (deadlock, Open never returns)
-	// and then reconnect() from inside Open. Handle them here while still
-	// holding the lock: close the socket, keep or discard the session info,
-	// and hand the decision to retry back to the caller.
+	// through dispatchEvent: it would call CloseWithCode() -> s.Lock() on the
+	// very goroutine that already holds the lock (deadlock, Open never
+	// returns) and then reconnect() from inside Open. Handle them here while
+	// still holding the lock: close the socket, keep or discard the session
+	// info, and hand the decision to retry back to the caller. Op 11 takes
+	// s.Lock in dispatchEvent too, so it is applied inline.
 	switch e.Operation {
 	case 9:
 		err = s.invalidSessionDuringOpen(e)
 		return err
 	case 7:
-		s.log(LogWarning, "Op 7 Reconnect received before READY/RESUMED, closing websocket")
+		s.log(LogWarning, "Op 7 Reconnect received before READY/RESUMED, closing websocket without reconnect")
 		s.sendCloseFrame(websocket.CloseServiceRestart)
-		err = fmt.Errorf("gateway requested reconnect (Op 7) before READY/RESUMED")
+		err = ErrReconnectRequested
 		return err
-	}
-	if err = s.dispatchEvent(e); err != nil {
-		return err
+	case 11:
+		s.LastHeartbeatAck = time.Now().UTC()
+		s.log(LogDebug, "got heartbeat ACK")
+	default:
+		if err = s.dispatchEvent(e); err != nil {
+			return err
+		}
 	}
 	if e.Type != `READY` && e.Type != `RESUMED` {
 		// This is not fatal, but it does not follow their API documentation.
@@ -976,7 +990,10 @@ func (s *Session) identify() error {
 // invalidSessionDuringOpen handles an Op 9 that arrives as the answer to our
 // Identify/Resume while Open still holds s.Lock. It only sends a close frame
 // and updates the session bookkeeping; Open's deferred cleanup closes the
-// socket because a non-nil error is returned.
+// socket because a non-nil error is returned. A payload that fails to decode
+// is deliberately treated as "not resumable": discarding the session forces a
+// fresh Identify on the next Open instead of retrying a Resume Discord may
+// keep rejecting.
 func (s *Session) invalidSessionDuringOpen(e *Event) error {
 	var resumable bool
 	if err := json.Unmarshal(e.RawData, &resumable); err != nil {
@@ -998,10 +1015,10 @@ func (s *Session) invalidSessionDuringOpen(e *Event) error {
 // wrapOpenReadErr maps a read-deadline expiry during Open to ErrOpenTimeout
 // (wrapped, so errors.Is works and the stage stays visible); other errors pass
 // through unchanged.
-func wrapOpenReadErr(err error, stage string) error {
+func wrapOpenReadErr(err error, stage string, timeout time.Duration) error {
 	var ne net.Error
 	if errors.As(err, &ne) && ne.Timeout() {
-		return fmt.Errorf("%w: no %s packet after %s", ErrOpenTimeout, stage, OpenReadTimeout)
+		return fmt.Errorf("%w: no %s packet after %s", ErrOpenTimeout, stage, timeout)
 	}
 	return err
 }
